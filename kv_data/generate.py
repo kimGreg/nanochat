@@ -12,6 +12,15 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import concurrent.futures
 
+import argparse
+
+from nanochat.common import get_base_dir
+
+
+base_dir = get_base_dir()
+DATA_DIR = os.path.join(base_dir, "base_data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
 def load_english_words(
     max_words: int = None,
     filter_by_length: bool = False,
@@ -215,7 +224,12 @@ def generate_dataset(
         rows = buffers[split_name]
         if not rows:
             return
-        out_dir = os.path.join(out_root, split_name)
+        
+        if split_name != "train":
+            out_dir = os.path.join(out_root, split_name)
+        else:
+            out_dir = out_root
+        
         shard_idx = shard_counters[split_name]
         write_shard(rows, out_dir, shard_idx=shard_idx)
         shard_counters[split_name] += 1
@@ -266,14 +280,21 @@ def generate_dataset(
 
 if __name__ == "__main__":
     random.seed(42)
+    parser = argparse.ArgumentParser(description="Generate KV dataset")
+    parser.add_argument("-n", "--num-sample", type=int, default=100_000, help="")
+    parser.add_argument("--min_pairs", type=int, default=4)
+    parser.add_argument("--max_pairs", type=int, default=10_000) 
+     
+    args = parser.parse_args()
+
     generate_dataset(
-        total_samples=100_000,
-        train_ratio=0.9,
-        val_ratio=0.05,
-        test_ratio=0.05,
+        total_samples=args.num_sample,
+        train_ratio=1.0,
+        val_ratio=0.00,
+        test_ratio=0.00,
         samples_per_shard=10_000,
-        min_pairs=4,
-        max_pairs=10_000, 
-        out_root="kv_base_data_english_simple",
+        min_pairs=args.min_pairs,
+        max_pairs=args.max_pairs, 
+        out_root=DATA_DIR,
         max_dict_words=170_000,
     )
