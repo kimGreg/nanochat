@@ -29,7 +29,7 @@ uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
 
 # python -m nanochat.dataset -n 8
 
-python -m kv_data.generate -n 20000
+python -m kv_data.generate -n 800000 --min-pairs 4 --max-pairs 200 --seed 24
 
 python -m scripts.tok_train --max_chars=2000000000
 
