@@ -1,5 +1,6 @@
 import os
 import random
+import json
 from typing import List, Optional, Tuple
 
 import pyarrow as pa
@@ -45,6 +46,7 @@ def make_sample(
     num_pairs: int,
     words: List[str],
     rng: random.Random,
+    q_position_mode: str = "uniform",
 ) -> Tuple[str, int, int, str, str]:
     if num_pairs <= 0:
         raise ValueError("num_pairs must be > 0")
@@ -63,7 +65,7 @@ def make_sample(
     items = list(zip(keys, values))
     rng.shuffle(items)
 
-    q_pair_idx = rng.randrange(num_pairs)
+    q_pair_idx = choose_q_index(num_pairs, rng, q_position_mode)
     q_key, q_value = items[q_pair_idx]
 
     kv_lines = [f"{k} {v}" for k, v in items]
@@ -119,33 +121,44 @@ def _make_pair_counts(
     raise ValueError(f"Unknown mode: {mode}")
 
 
-def _save_heatmap(heat_pairs, heat_qidx, out_root: str):
+def choose_q_index(num_pairs: int, rng: random.Random, mode: str = "uniform") -> int:
+    if num_pairs <= 0:
+        raise ValueError("num_pairs must be positive")
+    if mode == "uniform":
+        return rng.randrange(num_pairs)
+    if mode in ("front", "beginning"):
+        window = max(1, num_pairs // 4)
+        return rng.randrange(window)
+    if mode in ("back", "end", "near_query"):
+        window = max(1, num_pairs // 4)
+        return num_pairs - window + rng.randrange(window)
+    if mode == "middle":
+        center = (num_pairs - 1) / 2
+        std = max(1.0, num_pairs * 0.1)
+        idx = int(round(rng.gauss(center, std)))
+        return max(0, min(num_pairs - 1, idx))
+    raise ValueError(f"Unknown q_position_mode: {mode}")
+
+
+def _save_heatmap(heat_pairs, heat_qidx, out_root: str, max_pairs_hint: int = None, max_qidx_hint: int = None):
     if not heat_pairs:
         return
 
     max_pairs_seen = max(heat_pairs)
     max_qidx_seen = max(heat_qidx)
 
-    # x_bins = min(max_pairs_seen, 100)
-    # y_bins = min(max_qidx_seen + 1, 100) if max_qidx_seen > 0 else 1
+    max_pairs_plot = max(max_pairs_seen, max_pairs_hint) if max_pairs_hint else max_pairs_seen
+    max_qidx_plot = max(max_qidx_seen, max_qidx_hint) if max_qidx_hint else max_qidx_seen
 
-    # H, xedges, yedges = np.histogram2d(
-    #     heat_pairs,
-    #     heat_qidx,
-    #     bins=[x_bins, y_bins],
-    # )
-    
-    x_bins = max_pairs_seen      # 정수 개수만큼
-    y_bins = max_qidx_seen + 1                   # 0 ~ max_qidx
+    x_bins = max_pairs_plot
+    y_bins = max_qidx_plot + 1
 
     H, xedges, yedges = np.histogram2d(
         heat_pairs,
         heat_qidx,
         bins=[x_bins, y_bins],
-        range=[[0.5, max_pairs_seen + 0.5],
-               [-0.5, max_qidx_seen + 0.5]],
+        range=[[0.5, max_pairs_plot + 0.5], [-0.5, max_qidx_plot + 0.5]],
     )
-
 
     plt.figure(figsize=(10, 8))
     plt.imshow(
@@ -175,11 +188,13 @@ def _init_worker(words):
 
 
 def _build_sample(args):
-    idx, num_pairs, base_seed = args
+    idx, num_pairs, base_seed, q_mode = args
     if WORDS is None:
         raise RuntimeError("WORDS is not initialized in worker")
     rng = random.Random(base_seed + idx)
-    text, n_pairs, q_idx, q_key, q_value = make_sample(num_pairs, WORDS, rng)
+    text, n_pairs, q_idx, q_key, q_value = make_sample(
+        num_pairs, WORDS, rng, q_position_mode=q_mode
+    )
     row = {
         "text": text,
         "num_pairs": n_pairs,
@@ -198,7 +213,23 @@ def generate_dataset(
     out_root: str = "kv_base_data_english_simple",
     max_dict_words: int = 170_000,
     seed: int = 42,
+    pair_count_mode: str = "linear",
+    q_position_mode: str = "uniform",
+    shard_prefix: str = "shard",
+    skip_if_exists: bool = False,
+    write_manifest: bool = True,
+    heatmap_max_pairs: Optional[int] = None,
+    **kwargs,
 ):
+    os.makedirs(out_root, exist_ok=True)
+    existing = [
+        f for f in os.listdir(out_root)
+        if f.endswith(".parquet") and not f.endswith(".tmp")
+    ]
+    if skip_if_exists and existing:
+        print(f"[*] Skipping generation for {out_root} (found {len(existing)} parquet files)")
+        return
+
     rng = random.Random(seed)
 
     print("[*] load english words..")
@@ -214,7 +245,7 @@ def generate_dataset(
     print("[*] Synthetic KV Retrieval Dataset Generation Started...")
 
     pair_counts = _make_pair_counts(
-        total_samples, min_pairs, max_pairs, rng=rng, mode="linear"
+        total_samples, min_pairs, max_pairs, rng=rng, mode=pair_count_mode
     )
 
     buffer = []
@@ -231,7 +262,7 @@ def generate_dataset(
         initializer=_init_worker,
         initargs=(words,),
     ) as executor:
-        args_iter = ((i, pc, seed) for i, pc in enumerate(pair_counts))
+        args_iter = ((i, pc, seed, q_position_mode) for i, pc in enumerate(pair_counts))
         for idx, row in tqdm(
             executor.map(_build_sample, args_iter, chunksize=128),
             total=total_samples,
@@ -243,18 +274,38 @@ def generate_dataset(
             heat_qidx.append(row["q_pair_idx"])
 
             if len(buffer) >= samples_per_shard:
-                write_shard(buffer, out_root, shard_idx=shard_idx)
+                write_shard(buffer, out_root, shard_idx=shard_idx, prefix=shard_prefix)
                 shard_idx += 1
                 buffer.clear()
 
     if buffer:
-        write_shard(buffer, out_root, shard_idx=shard_idx)
+        write_shard(buffer, out_root, shard_idx=shard_idx, prefix=shard_prefix)
 
-    _save_heatmap(heat_pairs, heat_qidx, out_root)
+    max_pairs_hint = heatmap_max_pairs if heatmap_max_pairs is not None else max_pairs
+    max_qidx_hint = max_pairs_hint - 1 if max_pairs_hint else None
+    _save_heatmap(heat_pairs, heat_qidx, out_root, max_pairs_hint=max_pairs_hint, max_qidx_hint=max_qidx_hint)
 
     print("[DONE] dataset generated")
     print(f" - total samples: {total_samples}")
     print(f" - shards: {shard_idx + (1 if buffer else 0)}")
+
+    if write_manifest:
+        manifest = {
+            "total_samples": total_samples,
+            "samples_per_shard": samples_per_shard,
+            "min_pairs": min_pairs,
+            "max_pairs": max_pairs,
+            "pair_count_mode": pair_count_mode,
+            "q_position_mode": q_position_mode,
+            "max_dict_words": max_dict_words,
+            "seed": seed,
+            "shard_prefix": shard_prefix,
+            "data_dir": os.path.abspath(out_root),
+            "heatmap_max_pairs": heatmap_max_pairs,
+        }
+        with open(os.path.join(out_root, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"[*] manifest written to {os.path.join(out_root, 'manifest.json')}")
 
 
 if __name__ == "__main__":
@@ -263,15 +314,28 @@ if __name__ == "__main__":
     parser.add_argument("--min-pairs", type=int, default=4)
     parser.add_argument("--max-pairs", type=int, default=2_000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--pair-mode", type=str, default="linear", choices=["linear", "uniform"])
+    parser.add_argument(
+        "--q-position-mode",
+        type=str,
+        default="uniform",
+        choices=["uniform", "front", "beginning", "middle", "back", "end", "near_query"],
+    )
+    parser.add_argument("--out-root", type=str, default=DATA_DIR)
+    parser.add_argument("--samples-per-shard", type=int, default=10_000)
+    parser.add_argument("--heatmap-max-pairs", type=int, default=None)
 
     args = parser.parse_args()
 
     generate_dataset(
         total_samples=args.num_sample,
-        samples_per_shard=10_000,
+        samples_per_shard=args.samples_per_shard,
         min_pairs=args.min_pairs,
         max_pairs=args.max_pairs,
-        out_root=DATA_DIR,
+        out_root=args.out_root,
         max_dict_words=170_000,
         seed=args.seed,
+        pair_count_mode=args.pair_mode,
+        q_position_mode=args.q_position_mode,
+        heatmap_max_pairs=args.heatmap_max_pairs,
     )

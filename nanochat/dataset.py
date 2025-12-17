@@ -27,12 +27,25 @@ base_dir = get_base_dir()
 DATA_DIR = os.path.join(base_dir, "base_data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Allows overriding the dataset directory via environment variable without touching code
+def resolve_data_dir(data_dir=None):
+    """
+    Pick a parquet root directory, preferring (in order):
+    1) an explicit argument
+    2) the env var NANOCHAT_DATA_DIR
+    3) the default base_data folder under the nanochat base dir
+    """
+    if data_dir is not None:
+        return data_dir
+    env_dir = os.environ.get("NANOCHAT_DATA_DIR")
+    return env_dir if env_dir else DATA_DIR
+
 # -----------------------------------------------------------------------------
 # These functions are useful utilities to other modules, can/should be imported
 
 def list_parquet_files(data_dir=None):
     """ Looks into a data dir and returns full paths to all parquet files. """
-    data_dir = DATA_DIR if data_dir is None else data_dir
+    data_dir = resolve_data_dir(data_dir)
     parquet_files = sorted([
         f for f in os.listdir(data_dir)
         if f.endswith('.parquet') and not f.endswith('.tmp')
@@ -62,7 +75,7 @@ def download_single_file(index):
 
     # Construct the local filepath for this file and skip if it already exists
     filename = index_to_filename(index)
-    filepath = os.path.join(DATA_DIR, filename)
+    filepath = os.path.join(resolve_data_dir(), filename)
     if os.path.exists(filepath):
         print(f"Skipping {filepath} (already exists)")
         return True
@@ -118,7 +131,7 @@ if __name__ == "__main__":
     num = MAX_SHARD + 1 if args.num_files == -1 else min(args.num_files, MAX_SHARD + 1)
     ids_to_download = list(range(num))
     print(f"Downloading {len(ids_to_download)} shards using {args.num_workers} workers...")
-    print(f"Target directory: {DATA_DIR}")
+    print(f"Target directory: {resolve_data_dir()}")
     print()
     with Pool(processes=args.num_workers) as pool:
         results = pool.map(download_single_file, ids_to_download)
